@@ -1,14 +1,25 @@
-"""Clasificador académico de hongos con Streamlit y un modelo de Orange."""
+"""
+Clasificador de Hongos: Comestibles y Venenosos
+Aplicación académica con Streamlit y un modelo Random Forest exportado desde Orange.
+
+IMPORTANTE:
+- El archivo modelo.pkcls debe ser el modelo original exportado desde Orange Data Mining.
+- El modelo se carga mediante pickle. Solo debe utilizarse con archivos de modelo de confianza.
+- Las predicciones son exclusivamente educativas y no deben utilizarse para decidir si un hongo
+  silvestre es seguro para el consumo.
+"""
+
 from pathlib import Path
 import pickle
 
 import numpy as np
 import streamlit as st
 
+# Importaciones de Orange necesarias para registrar las clases utilizadas
+# al serializar el modelo .pkcls.
 try:
     import Orange
     from Orange.base import Model
-    # Registrar clases que pueden estar referenciadas por el archivo serializado.
     import Orange.classification.random_forest  # noqa: F401
     import Orange.preprocess.impute  # noqa: F401
     import Orange.preprocess.transformation  # noqa: F401
@@ -19,16 +30,37 @@ except Exception as exc:
 else:
     ORANGE_IMPORT_ERROR = None
 
-BASE_DIR = Path(__file__).resolve().parent
-MODEL_PATH = BASE_DIR / "modelo.pkcls"
 
-# Límites observados en Mushroom_Dataset.xlsx (1489 registros).
-NUMERIC_CONFIG = {
-    "cap-diameter": {"min": 2.19, "max": 18.89, "default": 7.09},
-    "stem-height": {"min": 4.78, "max": 19.46, "default": 7.97},
-    "stem-width": {"min": 5.47, "max": 19.96, "default": 13.02},
+DIRECTORIO_PROYECTO = Path(__file__).resolve().parent
+RUTA_MODELO = DIRECTORIO_PROYECTO / "modelo.pkcls"
+
+# Categorías observadas en Mushroom_Dataset.xlsx.
+OPCIONES_CATEGORICAS = {
+    "cap-shape": ["Convexa", "Plana", "Campana"],
+    "cap-surface": ["Estriada", "Brillante", "Pegajosa", "Escamosa", "Lisa"],
+    "cap-color": ["Naranja", "Blanco", "Amarillo"],
+    "gill-attachment": ["Libre", "Adherido", "Adnato", "Poros"],
+    "gill-color": ["Blanco", "Amarillo", "Negro"],
+    "stem-color": ["Blanco", "Amarillo"],
+    "ring-type": ["Estriado", "Colgante", "Grande", "Zona"],
+    "season": ["Invierno", "Verano", "Otoño", "Primavera"],
 }
-LABELS = {
+
+# Límites y valores iniciales calculados a partir del Excel entregado.
+# Se limita el formulario al intervalo observado en el conjunto de datos.
+CONFIG_NUMERICA = {
+    "cap-diameter": {
+        "min": 2.19, "max": 18.89, "default": 7.09, "step": 0.01
+    },
+    "stem-height": {
+        "min": 4.78, "max": 19.46, "default": 7.97, "step": 0.01
+    },
+    "stem-width": {
+        "min": 5.47, "max": 19.96, "default": 13.02, "step": 0.01
+    },
+}
+
+NOMBRES_ES = {
     "cap-diameter": "Diámetro del sombrero",
     "cap-shape": "Forma del sombrero",
     "cap-surface": "Superficie del sombrero",
@@ -42,185 +74,334 @@ LABELS = {
     "season": "Estación del año",
 }
 
+
 @st.cache_resource(show_spinner="Cargando el modelo Random Forest...")
-def load_model(path_string):
+def cargar_modelo(ruta_modelo: str):
+    """Carga el modelo Orange exportado en formato .pkcls."""
     if Orange is None:
         raise RuntimeError(
-            "No se pudo importar Orange3. Comprueba las dependencias. "
-            f"Detalle técnico: {ORANGE_IMPORT_ERROR}"
+            "No se pudo importar Orange3. Revisa la instalación de las dependencias. "
+            f"Detalle: {ORANGE_IMPORT_ERROR}"
         )
-    path = Path(path_string)
-    if not path.is_file():
-        raise FileNotFoundError("No se encontró modelo.pkcls junto a app.py.")
-    # Cargar únicamente el archivo .pkcls de confianza exportado por el propio proyecto.
-    with path.open("rb") as file:
-        model = pickle.load(file)
-    if not hasattr(model, "original_domain") or not hasattr(model, "domain"):
-        raise TypeError("El archivo no tiene la estructura esperada de un modelo Orange.")
-    if model.domain.class_var is None:
-        raise ValueError("El modelo no contiene una variable objetivo.")
-    if not model.original_domain.attributes:
-        raise ValueError("El modelo no contiene atributos de entrada.")
-    return model
+
+    ruta = Path(ruta_modelo)
+    if not ruta.exists():
+        raise FileNotFoundError(
+            f"No se encontró el archivo '{ruta.name}' en la carpeta de la aplicación."
+        )
+
+    # pickle.load es necesario porque .pkcls es el formato de serialización de Orange.
+    # No se debe cargar aquí ningún archivo .pkcls de procedencia desconocida.
+    with ruta.open("rb") as archivo:
+        modelo = pickle.load(archivo)
+
+    if not hasattr(modelo, "skl_model") or not hasattr(modelo, "original_domain"):
+        raise TypeError(
+            "El archivo no parece contener el clasificador Random Forest esperado de Orange."
+        )
+
+    if not hasattr(modelo, "domain") or modelo.domain.class_var is None:
+        raise ValueError("El modelo no contiene una variable objetivo de clasificación.")
+
+    return modelo
 
 
-def get_input_schema(model):
-    """Obtiene las categorías discretas del dominio del modelo, no de listas inventadas."""
-    schema = {}
-    for var in model.original_domain.attributes:
-        name = var.name
-        if name in LABELS:
-            if var.is_discrete:
-                schema[name] = {"kind": "categorical", "options": list(var.values)}
-            else:
-                schema[name] = {"kind": "numeric"}
-        elif "=" in name:
-            base, category = name.split("=", 1)
-            if base in LABELS:
-                schema.setdefault(base, {"kind": "categorical", "options": []})
-                if category not in schema[base]["options"]:
-                    schema[base]["options"].append(category)
-        else:
-            raise ValueError(
-                f"El atributo '{name}' del modelo no coincide con las 11 variables "
-                "del formulario. Revisa el preprocesamiento exportado desde Orange."
-            )
-    missing = set(LABELS) - set(schema)
-    if missing:
-        raise ValueError("El modelo no contiene estas variables: " + ", ".join(sorted(missing)))
-    return schema
+def construir_fila_entrada(modelo, valores_usuario):
+    """
+    Construye una fila respetando las variables y el orden del dominio original
+    que el propio modelo de Orange guarda.
 
+    También contempla variables indicadoras con nombres del tipo
+    'cap-shape=Convexa', si el dominio guardado por Orange contiene ese formato.
+    """
+    atributos = list(modelo.original_domain.attributes)
 
-def build_input_row(model, user_values):
-    row = []
-    for var in model.original_domain.attributes:
-        name = var.name
-        if name in user_values:
-            value = user_values[name]
-            if var.is_discrete:
-                if value not in var.values:
+    if not atributos:
+        raise ValueError("El dominio original del modelo no contiene variables predictoras.")
+
+    fila = []
+
+    for variable in atributos:
+        nombre_variable = variable.name
+
+        # Caso 1: atributo original con el mismo nombre que una variable del formulario.
+        if nombre_variable in valores_usuario:
+            valor = valores_usuario[nombre_variable]
+
+            if variable.is_discrete:
+                if valor not in variable.values:
                     raise ValueError(
-                        f"'{value}' no es una categoría válida para '{name}'. "
-                        f"Opciones del modelo: {', '.join(var.values)}"
+                        f"La categoría '{valor}' no está contemplada por el modelo "
+                        f"para la variable '{nombre_variable}'."
                     )
-                value = var.to_val(value)
+                valor = variable.to_val(valor)
             else:
-                value = float(value)
-            row.append(value)
+                valor = float(valor)
+
+            fila.append(valor)
             continue
-        if "=" in name:
-            base, category = name.split("=", 1)
-            if base in user_values:
-                row.append(float(user_values[base] == category))
+
+        # Caso 2: atributo indicador generado por Continuize, por ejemplo:
+        # cap-shape=Convexa. Se calcula 1 si coincide con la categoría elegida y 0
+        # en caso contrario. Esto no sustituye el preprocesamiento del modelo:
+        # permite representar variables indicadoras que estén en el dominio original.
+        if "=" in nombre_variable:
+            nombre_base, categoria = nombre_variable.split("=", 1)
+            if nombre_base in valores_usuario:
+                valor_indicador = float(valores_usuario[nombre_base] == categoria)
+                fila.append(valor_indicador)
                 continue
-        raise ValueError(f"No se pudo completar el atributo del modelo: {name}")
-    return row
+
+        raise ValueError(
+            "No fue posible asociar la variable del modelo "
+            f"'{nombre_variable}' con los datos ingresados. "
+            "Se detuvo la predicción para evitar utilizar un orden o una codificación incorrectos."
+        )
+
+    return fila
 
 
-def predict(model, user_values):
-    row = build_input_row(model, user_values)
-    input_domain = Orange.data.Domain(model.original_domain.attributes)
-    data = Orange.data.Table.from_list(input_domain, [row])
-    predictions, probabilities = model(data, ret=Model.ValueProbs)
+def obtener_prediccion(modelo, valores_usuario):
+    """Ejecuta la predicción y obtiene las probabilidades si están disponibles."""
+    fila = construir_fila_entrada(modelo, valores_usuario)
 
-    class_var = model.domain.class_var
-    classes = list(class_var.values)
-    pred_array = np.asarray(predictions).reshape(-1)
-    predicted_index = int(round(float(pred_array[0])))
-    if not 0 <= predicted_index < len(classes):
-        raise ValueError("El modelo devolvió un índice de clase no válido.")
+    # Se crea una tabla sin variable objetivo. Orange se encarga de transformar
+    # los datos desde el dominio original hasta el dominio usado por el modelo.
+    dominio_entrada = Orange.data.Domain(modelo.original_domain.attributes)
+    tabla_entrada = Orange.data.Table.from_list(dominio_entrada, [fila])
 
-    probs = np.asarray(probabilities, dtype=float)
-    if probs.ndim == 1:
-        probs = probs.reshape(1, -1)
-    probs = probs[0]
-    if len(probs) != len(classes):
-        raise ValueError("Las probabilidades no coinciden con las clases del modelo.")
-    return classes[predicted_index], dict(zip(classes, probs.tolist()))
+    prediccion, probabilidades = modelo(tabla_entrada, ret=Model.ValueProbs)
+
+    variable_objetivo = modelo.domain.class_var
+    clases = list(variable_objetivo.values)
+
+    prediccion_array = np.asarray(prediccion).reshape(-1)
+    indice_predicho = int(round(float(prediccion_array[0])))
+
+    if indice_predicho < 0 or indice_predicho >= len(clases):
+        raise ValueError("El modelo devolvió una clase que no coincide con su variable objetivo.")
+
+    nombre_clase = clases[indice_predicho]
+
+    probabilidades_array = np.asarray(probabilidades, dtype=float)
+    if probabilidades_array.ndim == 1:
+        probabilidades_array = probabilidades_array.reshape(1, -1)
+
+    probabilidades_fila = probabilidades_array[0]
+
+    if len(probabilidades_fila) != len(clases):
+        raise ValueError(
+            "La cantidad de probabilidades devueltas no coincide con las clases del modelo."
+        )
+
+    return nombre_clase, dict(zip(clases, probabilidades_fila))
 
 
-st.set_page_config(page_title="Clasificador de Hongos", page_icon="🍄", layout="wide")
+# ---------------------------------------------------------------------
+# INTERFAZ
+# ---------------------------------------------------------------------
+
+st.set_page_config(
+    page_title="Clasificador de Hongos",
+    page_icon="🍄",
+    layout="wide",
+)
+
 st.title("🍄 Clasificador de Hongos")
-st.subheader("Clasificación académica: Comestible o Venenoso")
-st.write(
-    "Ingresa las características físicas para obtener la predicción del modelo "
-    "Random Forest entrenado en Orange Data Mining."
-)
-st.warning(
-    "Uso exclusivamente académico. Esta aplicación no identifica de forma fiable "
-    "hongos silvestres ni debe utilizarse para decidir si son seguros para consumir."
+st.subheader("Identificación académica: Comestible o Venenoso")
+
+st.markdown(
+    """
+    Esta aplicación utiliza un modelo **Random Forest entrenado en Orange Data Mining**
+    para clasificar hongos a partir de sus características físicas.
+    """
 )
 
+st.info(
+    "Aviso académico: esta herramienta es exclusivamente educativa. "
+    "Sus resultados no garantizan la identificación correcta de un hongo y "
+    "**no deben utilizarse para decidir si un hongo silvestre es seguro para consumir**."
+)
+
+with st.expander("¿Cómo funciona esta aplicación?"):
+    st.write(
+        "El usuario ingresa las características físicas del hongo. La aplicación "
+        "envía esos datos al modelo Random Forest exportado desde Orange. El modelo "
+        "conserva su dominio y sus transformaciones para preparar los datos antes "
+        "de realizar la predicción."
+    )
+
+# Carga del modelo y comprobación inicial.
 try:
-    model = load_model(str(MODEL_PATH))
-    schema = get_input_schema(model)
+    modelo = cargar_modelo(str(RUTA_MODELO))
+    st.sidebar.success("Modelo Random Forest cargado correctamente")
+    st.sidebar.write(f"**Archivo:** {RUTA_MODELO.name}")
+    st.sidebar.write(f"**Algoritmo:** {getattr(modelo, 'name', 'Random Forest')}")
+    st.sidebar.write(
+        f"**Variable objetivo:** {modelo.domain.class_var.name}"
+    )
+    st.sidebar.write(
+        f"**Clases:** {', '.join(modelo.domain.class_var.values)}"
+    )
 except Exception as error:
-    st.error("No se pudo preparar el modelo para la clasificación.")
+    st.error("No se pudo cargar el modelo de clasificación.")
     st.exception(error)
     st.stop()
 
-st.sidebar.success("Modelo cargado")
-st.sidebar.write(f"**Archivo:** {MODEL_PATH.name}")
-st.sidebar.write(f"**Objetivo:** {model.domain.class_var.name}")
-st.sidebar.write("**Clases:** " + ", ".join(model.domain.class_var.values))
+st.divider()
+st.header("1. Ingrese las características del hongo")
+st.caption(
+    "Complete los campos según las características observadas. "
+    "Los valores numéricos están limitados al intervalo encontrado en el dataset."
+)
 
-st.header("1. Características del hongo")
-with st.form("mushroom_form"):
-    cols = st.columns(3)
-    user_values = {}
-    groups = [
-        ["cap-diameter", "cap-shape", "cap-surface", "cap-color"],
-        ["gill-attachment", "gill-color", "stem-height", "stem-width"],
-        ["stem-color", "ring-type", "season"],
-    ]
-    for col, fields in zip(cols, groups):
-        with col:
-            for field in fields:
-                label = LABELS[field]
-                info = schema[field]
-                if info["kind"] == "categorical":
-                    options = info["options"]
-                    if not options:
-                        st.error(f"El modelo no ofrece categorías para {label}.")
-                        st.stop()
-                    user_values[field] = st.selectbox(label, options, key=f"input_{field}")
-                else:
-                    cfg = NUMERIC_CONFIG[field]
-                    user_values[field] = st.number_input(
-                        label, min_value=float(cfg["min"]), max_value=float(cfg["max"]),
-                        value=float(cfg["default"]), step=0.01, format="%.2f",
-                        key=f"input_{field}"
-                    )
-    submitted = st.form_submit_button("🍄 Clasificar hongo", type="primary", use_container_width=True)
+with st.form("formulario_hongo"):
+    columna_izquierda, columna_central, columna_derecha = st.columns(3)
 
-if submitted:
-    try:
-        with st.spinner("Analizando las características..."):
-            predicted_class, class_probabilities = predict(model, user_values)
-        st.header("2. Resultado")
-        normalized = str(predicted_class).strip().casefold()
-        if normalized == "comestible":
-            st.success("Clasificación del modelo: COMESTIBLE")
-        elif normalized == "venenoso":
-            st.error("Clasificación del modelo: VENENOSO")
-        else:
-            st.info(f"Clasificación del modelo: {str(predicted_class).upper()}")
-        st.subheader("Probabilidades estimadas")
-        result_cols = st.columns(len(class_probabilities))
-        for col, (class_name, probability) in zip(result_cols, class_probabilities.items()):
-            pct = float(probability) * 100
-            with col:
-                st.metric(str(class_name).upper(), f"{pct:.2f}%")
-                st.progress(min(max(float(probability), 0.0), 1.0))
-        st.caption("Las probabilidades son estimaciones del modelo, no garantías de certeza ni de seguridad alimentaria.")
-        st.subheader("Datos ingresados")
-        st.dataframe(
-            [{"Característica": LABELS[key], "Valor": value} for key, value in user_values.items()],
-            use_container_width=True, hide_index=True
+    with columna_izquierda:
+        st.markdown("**Sombrero**")
+        cap_diameter = st.number_input(
+            "Diámetro del sombrero",
+            min_value=CONFIG_NUMERICA["cap-diameter"]["min"],
+            max_value=CONFIG_NUMERICA["cap-diameter"]["max"],
+            value=CONFIG_NUMERICA["cap-diameter"]["default"],
+            step=CONFIG_NUMERICA["cap-diameter"]["step"],
+            format="%.2f",
+            help="Variable cap-diameter del conjunto de datos.",
         )
+        cap_shape = st.selectbox(
+            "Forma del sombrero",
+            OPCIONES_CATEGORICAS["cap-shape"],
+        )
+        cap_surface = st.selectbox(
+            "Superficie del sombrero",
+            OPCIONES_CATEGORICAS["cap-surface"],
+        )
+        cap_color = st.selectbox(
+            "Color del sombrero",
+            OPCIONES_CATEGORICAS["cap-color"],
+        )
+
+    with columna_central:
+        st.markdown("**Láminas y tallo**")
+        gill_attachment = st.selectbox(
+            "Unión de las láminas",
+            OPCIONES_CATEGORICAS["gill-attachment"],
+        )
+        gill_color = st.selectbox(
+            "Color de las láminas",
+            OPCIONES_CATEGORICAS["gill-color"],
+        )
+        stem_height = st.number_input(
+            "Altura del tallo",
+            min_value=CONFIG_NUMERICA["stem-height"]["min"],
+            max_value=CONFIG_NUMERICA["stem-height"]["max"],
+            value=CONFIG_NUMERICA["stem-height"]["default"],
+            step=CONFIG_NUMERICA["stem-height"]["step"],
+            format="%.2f",
+            help="Variable stem-height del conjunto de datos.",
+        )
+        stem_width = st.number_input(
+            "Ancho del tallo",
+            min_value=CONFIG_NUMERICA["stem-width"]["min"],
+            max_value=CONFIG_NUMERICA["stem-width"]["max"],
+            value=CONFIG_NUMERICA["stem-width"]["default"],
+            step=CONFIG_NUMERICA["stem-width"]["step"],
+            format="%.2f",
+            help="Variable stem-width del conjunto de datos.",
+        )
+
+    with columna_derecha:
+        st.markdown("**Otras características**")
+        stem_color = st.selectbox(
+            "Color del tallo",
+            OPCIONES_CATEGORICAS["stem-color"],
+        )
+        ring_type = st.selectbox(
+            "Tipo de anillo",
+            OPCIONES_CATEGORICAS["ring-type"],
+        )
+        season = st.selectbox(
+            "Estación del año",
+            OPCIONES_CATEGORICAS["season"],
+        )
+
+    enviar = st.form_submit_button(
+        "🍄 Clasificar hongo",
+        type="primary",
+        use_container_width=True,
+    )
+
+if enviar:
+    datos_ingresados = {
+        "cap-diameter": cap_diameter,
+        "cap-shape": cap_shape,
+        "cap-surface": cap_surface,
+        "cap-color": cap_color,
+        "gill-attachment": gill_attachment,
+        "gill-color": gill_color,
+        "stem-height": stem_height,
+        "stem-width": stem_width,
+        "stem-color": stem_color,
+        "ring-type": ring_type,
+        "season": season,
+    }
+
+    try:
+        with st.spinner("Analizando las características con Random Forest..."):
+            clase, probabilidades = obtener_prediccion(modelo, datos_ingresados)
+
+        st.divider()
+        st.header("2. Resultado de la clasificación")
+
+        clase_normalizada = str(clase).strip().lower()
+
+        if clase_normalizada == "comestible":
+            st.success("Clasificación obtenida: COMESTIBLE")
+        elif clase_normalizada == "venenoso":
+            st.error("Clasificación obtenida: VENENOSO")
+        else:
+            st.warning(f"Clasificación obtenida: {str(clase).upper()}")
+
+        st.markdown("### Porcentajes de predicción")
+
+        columnas_resultado = st.columns(len(probabilidades))
+        for columna, (nombre, probabilidad) in zip(columnas_resultado, probabilidades.items()):
+            porcentaje = float(probabilidad) * 100
+            with columna:
+                st.metric(nombre.upper(), f"{porcentaje:.2f}%")
+                st.progress(
+                    min(max(float(probabilidad), 0.0), 1.0),
+                    text=f"{porcentaje:.2f}%"
+                )
+
+        st.caption(
+            "Los porcentajes corresponden a las probabilidades estimadas por el "
+            "clasificador Random Forest. No representan una garantía de certeza "
+            "ni una evaluación de seguridad alimentaria."
+        )
+
+        st.markdown("### Características ingresadas")
+        resumen = {
+            NOMBRES_ES[nombre]: valor
+            for nombre, valor in datos_ingresados.items()
+        }
+        st.dataframe(
+            [{"Característica": nombre, "Valor ingresado": valor}
+             for nombre, valor in resumen.items()],
+            use_container_width=True,
+            hide_index=True,
+        )
+
     except Exception as error:
-        st.error("No se pudo completar la predicción. No se mostrará un resultado no validado.")
+        st.error(
+            "No se pudo realizar la predicción. No se ha generado una clasificación "
+            "porque los datos no pudieron asociarse de forma segura con el dominio del modelo."
+        )
         st.exception(error)
 
 st.divider()
-st.caption("Proyecto académico de Inteligencia Artificial Aplicada | Dataset: Mushroom_Dataset.xlsx | Modelo: Random Forest (Orange)")
+st.caption(
+    "Proyecto académico de Inteligencia Artificial Aplicada | "
+    "Dataset: Mushroom_Dataset.xlsx | Modelo: Random Forest (Orange Data Mining)"
+)
